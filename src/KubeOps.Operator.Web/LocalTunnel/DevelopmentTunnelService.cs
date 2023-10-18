@@ -19,13 +19,19 @@ internal class DevelopmentTunnelService : IHostedService
 {
     private readonly TunnelConfig _config;
     private readonly WebhookLoader _loader;
+    private readonly IKubernetesClient _client;
     private readonly LocaltunnelClient _tunnelClient;
     private Tunnel? _tunnel;
 
-    public DevelopmentTunnelService(ILoggerFactory loggerFactory, TunnelConfig config, WebhookLoader loader)
+    public DevelopmentTunnelService(
+        ILoggerFactory loggerFactory,
+        TunnelConfig config,
+        WebhookLoader loader,
+        IKubernetesClient client)
     {
         _config = config;
         _loader = loader;
+        _client = client;
         _tunnelClient = new(loggerFactory);
     }
 
@@ -40,14 +46,13 @@ internal class DevelopmentTunnelService : IHostedService
         await _tunnel.StartAsync(cancellationToken: cancellationToken);
         await RegisterValidators(_tunnel.Information.Url);
         await RegisterMutators(_tunnel.Information.Url);
+        await RegisterConverters(_tunnel.Information.Url);
     }
 
-    public async Task StopAsync(CancellationToken cancellationToken)
+    public Task StopAsync(CancellationToken cancellationToken)
     {
         _tunnel?.Dispose();
-        using var client = new KubernetesClient.KubernetesClient() as IKubernetesClient;
-        await client.DeleteAsync<V1ValidatingWebhookConfiguration>("dev-validators");
-        await client.DeleteAsync<V1MutatingWebhookConfiguration>("dev-mutators");
+        return Task.CompletedTask;
     }
 
     private async Task RegisterValidators(Uri uri)
@@ -84,8 +89,7 @@ internal class DevelopmentTunnelService : IHostedService
 
         if (validatorConfig.Webhooks.Any())
         {
-            using var validatorClient = new KubernetesClient.KubernetesClient() as IKubernetesClient;
-            await validatorClient.SaveAsync(validatorConfig);
+            await _client.SaveAsync(validatorConfig);
         }
     }
 
@@ -123,8 +127,39 @@ internal class DevelopmentTunnelService : IHostedService
 
         if (mutatorConfig.Webhooks.Any())
         {
-            using var mutatorClient = new KubernetesClient.KubernetesClient() as IKubernetesClient;
-            await mutatorClient.SaveAsync(mutatorConfig);
+            await _client.SaveAsync(mutatorConfig);
+        }
+    }
+
+    private async Task RegisterConverters(Uri uri)
+    {
+        var conversionWebhooks = _loader.ConversionWebhooks.ToList();
+        if (conversionWebhooks.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var wh in conversionWebhooks)
+        {
+            var metadata = Entities.ToEntityMetadata(wh.BaseType!.GenericTypeArguments[0]).Metadata;
+            var crdName = $"{metadata.PluralName}.{metadata.Group}";
+
+            if (await _client.GetAsync<V1CustomResourceDefinition>(crdName) is not { } crd)
+            {
+                continue;
+            }
+
+            var whUrl = $"{uri}convert/{metadata.Group}/{metadata.PluralName}";
+            crd.Spec.Conversion = new V1CustomResourceConversion("Webhook")
+            {
+                Webhook = new V1WebhookConversion
+                {
+                    ConversionReviewVersions = new[] { "v1" },
+                    ClientConfig = new Apiextensionsv1WebhookClientConfig { Url = whUrl },
+                },
+            };
+
+            await _client.UpdateAsync(crd);
         }
     }
 }
