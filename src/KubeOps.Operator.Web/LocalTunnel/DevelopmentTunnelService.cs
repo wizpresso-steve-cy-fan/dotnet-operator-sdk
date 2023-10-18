@@ -42,10 +42,12 @@ internal class DevelopmentTunnelService : IHostedService
         await RegisterMutators(_tunnel.Information.Url);
     }
 
-    public Task StopAsync(CancellationToken cancellationToken)
+    public async Task StopAsync(CancellationToken cancellationToken)
     {
         _tunnel?.Dispose();
-        return Task.CompletedTask;
+        using var client = new KubernetesClient.KubernetesClient() as IKubernetesClient;
+        await client.DeleteAsync<V1ValidatingWebhookConfiguration>("dev-validators");
+        await client.DeleteAsync<V1MutatingWebhookConfiguration>("dev-mutators");
     }
 
     private async Task RegisterValidators(Uri uri)
